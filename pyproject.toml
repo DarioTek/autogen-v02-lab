@@ -1,0 +1,19 @@
+[project]
+name = "autogen-v02-lab"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "DarioTek", email = "dmontecastro@yahoo.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "autogen[openai]<1.0",
+]
+
+[project.scripts]
+autogen-v02-lab = "autogen_v02_lab:main"
+
+[build-system]
+requires = ["uv_build>=0.12.18,<0.13.0"]
+build-backend = "uv_build"
