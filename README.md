@@ -22,10 +22,19 @@ Do not load 7B and 3B at the same time on 8 GB; `num_ctx` above 4096 wastes RAM.
 ### Run
 
 ```bash
-uv add "autogen[openai]<1.0"   # pin <1.0, see below
-uv run python src/autogen_v02_lab/autogen_v02_coder_reviewer_A.py
+uv sync   # installs autogen[openai]<1.0 + tzdata on Windows (see pyproject.toml)
+uv run autogen_v02_coder_reviewer_A.py
 # overrides: OLLAMA_BASE_URL=http://<pi-ip>:11434/v1 OLLAMA_MODEL=qwen2.5-coder:3b
 ```
+
+Notes:
+- **Do NOT** `pip install ag2[docker]` for the `docker is not installed`
+  ImportError — Phase 3 uses the `docker` CLI (`docker run --rm -v …:/work`),
+  not AutoGen's `DockerCommandLineCodeExecutor`, so no docker SDK is needed.
+- Windows hosts have no IANA tz database: if the local golden gate reports
+  `ZoneInfoNotFoundError`, that's a host issue, not a code error. `uv sync`
+  installs `tzdata`, and the gate now skips (instead of asking the LLM to
+  "repair" correct code) and lets Docker — which installs `tzdata` — decide.
 
 
 ```

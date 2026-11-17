@@ -44,7 +44,8 @@ Why this version differs from the 7B original (each change targets a known 3B fa
        - Docker stays on the laptop, Ollama stays on the Pi. Do not run
          Docker on the Pi for this pipeline.
 
-Requirements: pip install "pyautogen[docker]", Docker Desktop running,
+Requirements: `uv sync` (autogen[openai]<1.0; tzdata auto-added on Windows),
+Docker Desktop running (only the `docker` CLI is used — no docker Python SDK),
 Ollama serving qwen2.5-coder:3b on the Pi.
 Env overrides: OLLAMA_BASE_URL (default http://192.168.1.86:11434/v1),
                OLLAMA_MODEL (default qwen2.5-coder:3b).
@@ -60,7 +61,11 @@ from datetime import datetime
 from pathlib import Path
 
 from autogen import ConversableAgent, UserProxyAgent
-from autogen.coding import CodeBlock, DockerCommandLineCodeExecutor
+
+# NOTE: autogen.coding.DockerCommandLineCodeExecutor is intentionally NOT used:
+# it requires the `docker` Python SDK (`ag2[docker]` / `autogen[docker]`), which
+# autogen[openai] does not install. Phase 3 shells out to the `docker` CLI
+# instead (see run_checks_in_docker), so Docker Desktop alone is enough.
 
 # ----------------------------------------------------------------------------
 # Configuration (3B-tuned)
@@ -323,7 +328,17 @@ def extract_code(history: list[dict], filename: str) -> str | None:
         fallback = _strip_prose_fallback(text)
         if fallback is not None:
             found = fallback
-    return found
+    if found is None:
+        return None
+    # The '# FILE:' line is a transport marker, not file content. The 3B
+    # sometimes emits it outside a fence (observed in repair replies); strip
+    # it so saved files / equality checks are not polluted by it.
+    lines = found.splitlines()
+    while lines and FILE_HEADER_RE.match(lines[0]):
+        lines = lines[1:]
+        while lines and not lines[0].strip():
+            lines = lines[1:]
+    return "\n".join(lines).strip("\n") + "\n"
 
 
 # ----------------------------------------------------------------------------
@@ -338,12 +353,37 @@ def check_syntax(src: str, filename: str) -> str | None:
     return None
 
 
+# Sentinel prefix: the *host* (not the generated code) is broken. Never send
+# this to the LLM for repair — the model cannot fix the host's tz database,
+# and in testing it correctly returned its (correct) code unchanged, burning
+# two Pi generations. Docker is the arbiter for these cases.
+ENV_FAILURE_PREFIX = "ENV_FAILURE:"
+
+
+def host_tzdata_available() -> bool:
+    """Windows ships no IANA tz database; zoneinfo needs the `tzdata` package."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        ZoneInfo("America/New_York")
+    except Exception:  # noqa: BLE001 - ZoneInfoNotFoundError / ImportError
+        return False
+    return True
+
+
 def run_golden(src: str) -> str | None:
     """Run GOLDEN_CASES against the generated converter. None = all pass."""
     namespace: dict = {}
     try:
         exec(compile(src, "converter.py", "exec"), namespace)  # noqa: S102 - lab code
     except Exception as exc:  # noqa: BLE001 - report any import-time failure
+        if "ZoneInfoNotFoundError" in type(exc).__name__ or "No time zone found" in str(exc):
+            return (
+                f"{ENV_FAILURE_PREFIX} host has no IANA time zone database "
+                f"({exc}). This is NOT a code error. Fix: `uv sync` (tzdata is "
+                "a Windows dependency in pyproject.toml) or run on Linux. "
+                "Skipping local gate; Docker (with tzdata) will verify."
+            )
         return f"converter.py failed to import: {type(exc).__name__}: {exc}"
     fn = namespace.get("convert_epoch_timestamps")
     if not callable(fn):
@@ -352,6 +392,8 @@ def run_golden(src: str) -> str | None:
         try:
             got = fn(list(inp))
         except Exception as exc:  # noqa: BLE001
+            if "ZoneInfoNotFoundError" in type(exc).__name__ or "No time zone found" in str(exc):
+                return f"{ENV_FAILURE_PREFIX} host has no IANA time zone database ({exc})"
             return f"convert_epoch_timestamps({inp!r}) raised {type(exc).__name__}: {exc}"
         if got != expected:
             return f"convert_epoch_timestamps({inp!r}) -> {got!r}, expected {expected!r}"
@@ -447,14 +489,37 @@ def write_files(run_dir: Path, files: dict[str, str]) -> None:
 
 
 def run_checks_in_docker(run_dir: Path) -> tuple[int, str]:
-    """Run the static check and the unit tests inside a fresh, isolated container."""
-    with DockerCommandLineCodeExecutor(
-        image=DOCKER_IMAGE,
-        timeout=CHECK_TIMEOUT_SECONDS,
-        work_dir=run_dir,  # bind-mounted into the container as the working directory
-    ) as executor:
-        result = executor.execute_code_blocks([CodeBlock(code=CHECK_SCRIPT, language="sh")])
-    return result.exit_code, result.output
+    """Run ruff + unittest via the `docker` CLI in a fresh, isolated container.
+
+    Deliberately avoids DockerCommandLineCodeExecutor: it needs the `docker`
+    Python SDK (ImportError: 'docker' is not installed / install ag2[docker]),
+    while ensure_docker_running() already proved the CLI works. One less
+    dependency to install/pin on the laptop.
+    """
+    cmd = [
+        "docker", "run", "--rm",
+        "-v", f"{run_dir.resolve()}:/work",
+        "-w", "/work",
+        DOCKER_IMAGE,
+        "sh", "-c", CHECK_SCRIPT,
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=CHECK_TIMEOUT_SECONDS, check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        partial = ""
+        if isinstance(exc.stdout, str):
+            partial = exc.stdout
+        if isinstance(exc.stderr, str):
+            partial += exc.stderr
+        return 124, f"Docker checks timed out after {CHECK_TIMEOUT_SECONDS}s.\n{partial}"
+    except OSError as exc:
+        return 127, f"Could not run the docker CLI: {exc}"
+    output = "\n".join(p for p in (result.stdout.strip(), result.stderr.strip()) if p)
+    return result.returncode, output
 
 
 def write_report(
@@ -510,6 +575,12 @@ def generate_with_repairs(
         if failure is None:
             print(f"{filename}: local gate PASSED")
             return src
+        if failure.startswith(ENV_FAILURE_PREFIX):
+            # Host problem, not code problem: do NOT ask the 3B to repair it
+            # (it can't, and will just return the same correct code). The
+            # Docker step installs tzdata and is the real gate.
+            print(f"{filename}: local gate SKIPPED ({failure})")
+            return src
         print(f"{filename}: local gate FAILED ({failure})")
         if attempt == MAX_REPAIRS - 1:
             break
@@ -521,7 +592,10 @@ def generate_with_repairs(
             print(f"  Coder returned no usable {filename}; keeping previous version.")
             continue
         if fixed == src:
-            print("  Coder returned unchanged code; next repair will repeat the failure.")
+            # Unchanged code will fail identically; stop instead of burning
+            # more slow Pi generations on a loop that cannot progress.
+            print("  Coder returned unchanged code; stopping repairs (would loop).")
+            break
         src = fixed
 
     # Return the best effort; Docker is the final arbiter and will report honestly.
@@ -534,6 +608,12 @@ def generate_with_repairs(
 def main() -> int:
     ensure_docker_running()
     check_ollama()
+    if not host_tzdata_available():
+        print(
+            "Warning: host Python has no IANA tz database (common on Windows). "
+            "The local golden gate will be skipped; Docker (with tzdata) remains "
+            "the arbiter. Fix with `uv sync` — pyproject.toml pins tzdata on Windows."
+        )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = script_path.parent / "output" / f"{clean_name}_{timestamp}"

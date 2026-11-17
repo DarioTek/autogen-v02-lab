@@ -9,6 +9,11 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "autogen[openai]<1.0",
+    # Windows ships no IANA tz database, so zoneinfo.ZoneInfo("America/New_York")
+    # raises ZoneInfoNotFoundError on the host (Docker is unaffected: its check
+    # script installs tzdata via `uv run --with tzdata`). No `docker` extra is
+    # needed: Phase 3 uses the `docker` CLI, not the docker Python SDK.
+    "tzdata; sys_platform == 'win32'",
 ]
 
 [project.scripts]
