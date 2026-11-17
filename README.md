@@ -73,3 +73,45 @@ uv run autogen_v02_sample.py
 ### Additional notes
 
 According to the official AG2 documentation, the classic version is published on PyPI under the name **`autogen`** (not `ag2`, which is the new version's name), and `ConversableAgent` belongs to this classic version. The official documentation also recommends installing with `pip install "autogen[openai]"`, but for `uv` environments, explicitly adding `<1.0` is the safest approach to prevent `uv` from automatically resolving to a new version that breaks your code.
+
+---
+
+The core issue you're facing is that the prompts are too long and Qwen2.5-Coder-3B (despite supporting 32K context) is too weak to reliably follow complex multi-file instructions without getting confused. To optimize, you need to **drastically shorten the context** and **simplify the task structure** so the small model can focus on one thing at a time.
+
+### 1. Shorten the System Prompts and Specs
+The current `SPEC` and `REVIEWER_SYSTEM` are very verbose. A 3B model can lose track of instructions buried in long text. Cut them down to the absolute essentials.
+
+*   **Simplify `SPEC`**: Remove redundant examples and wordy explanations. Keep only the function signature, the timezone rule, and one or two critical examples (like the DST boundary).
+*   **Tighten `CODER_SYSTEM`**: Instead of a paragraph, use a terse command like: *"You are a Python coder. Output ONLY a python code block. First line: `# FILE: filename.py`. Use stdlib only. Address all reviewer points when revising."*
+*   **Tighten `REVIEWER_SYSTEM`**: A 3B model struggles with long checklists. Reduce it to: *"Check code against spec. If bugs, reply with a numbered list. If correct, reply ONLY `APPROVED`."*
+
+### 2. Reduce Conversation Turns and Context Bloat
+AutoGen passes the entire chat history back to the model on each turn. For a small model, this quickly fills the context window with noise.
+
+*   **Lower `MAX_REVIEW_TURNS`**: Change from `3` to `2` (or even `1` if you want to be aggressive). The 3B model is unlikely to fix complex issues in three back-and-forths; it will just get confused.
+*   **Truncate History Manually**: In `review_loop`, you copy the history for reporting, but the agents still see the full history. You can create a custom `summary_method` or use AutoGen's transforms to compress old messages, but for a 3B model, the simplest fix is to just accept fewer turns.
+*   **Check Ollama's `num_ctx`**: Ollama defaults to a small context window (often 2048 tokens) . Even if Qwen supports 32K , Ollama won't use it unless you set it. You should explicitly pass `num_ctx` in your `llm_config` or set the `OLLAMA_CONTEXT_LENGTH` environment variable on your Raspberry Pi. If the prompt exceeds the actual context window, the model's output will be garbage. Try setting `num_ctx` to `4096` or `8192` in your `llm_config`'s `config_list` item.
+
+### 3. Simplify the Repair Loop
+The current repair prompt includes the full `SPEC`, a 5000-character tail of the output, and the full current files. This is a huge amount of text for a 3B model to process.
+
+*   **Cut the Tail**: Reduce `output[-5000:]` to `output[-1500:]`. Ruff and unittest failures are usually at the end; the model doesn't need the full log.
+*   **Only Send the Broken File**: Instead of sending both `converter.py` and `test_converter.py` in the repair task, detect which one failed (from the ruff/unittest output) and send only that file. Less text = better focus for the small model.
+*   **Be Brutally Direct**: Change the repair instruction to: *"Fix the error shown below. Output ONLY the corrected file in one code block with `# FILE: name.py`."*
+
+### 4. Adjust Generation Parameters
+*   **Lower Temperature**: `temperature=0.2` is okay, but for a small model, `0.0` or `0.1` forces it to be more deterministic and less likely to hallucinate code structure.
+*   **Limit `max_tokens`**: In your `llm_config`, add `"max_tokens": 1500` (or similar). This prevents the model from rambling and wasting context on irrelevant text.
+
+### 5. Code Adjustments Summary
+Here are the specific changes you can make in your file:
+
+*   **In `llm_config`**: Add `"num_ctx": 8192` and `"max_tokens": 1500`.
+*   **In `SPEC`**: Remove 50% of the examples. Keep the function signature, the "floor to seconds" rule, the timezone name, and the isoformat requirement.
+*   **In `REVIEWER_SYSTEM`**: Reduce to one sentence.
+*   **In `build_repair_task`**: Change `output[-5000:]` to `output[-1500:]`. Remove the `SPEC` from the repair prompt (the coder already has it in context if the chat history is short, or just tell it "Follow the original spec").
+*   **In `MAX_REVIEW_TURNS`**: Set to `2`.
+
+The fundamental limitation is that a 3B model is not a great code reviewer or repair agent. By minimizing the context and making the instructions as blunt as possible, you give it the best chance of succeeding on the simpler sub-tasks (like writing a single function or fixing a syntax error), even if it can't handle the full pipeline reliably.
+
+
